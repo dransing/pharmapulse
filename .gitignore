@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+phase0_report.md
+.env
