@@ -1,26 +1,35 @@
 """
-PharmaPulse - Phase 0 Feasibility Spike (v2, corrected)
-=======================================================
+PharmaPulse - Phase 0 Feasibility Spike (v3, final)
+===================================================
 
-CHANGES FROM v1 - and why they matter
--------------------------------------
-v1 derived the fiscal year from XBRL's `fy` field. That field is the fiscal
-year of the FILING, not of the data point. A 10-K filed in 2025 contains
-comparative figures for FY2024, FY2023 and FY2022, and every one of them is
-tagged fy=2025, fp=FY, form=10-K. v1 therefore collapsed three distinct years
-into one slot and kept whichever record it happened to see first. The "34
-duplicate fiscal-year records" it reported were the symptom, not restatements.
+CHANGE LOG
+----------
+v1 -> v2:
+  Derived the fiscal year from each fact's period END date instead of XBRL's
+  `fy` field. `fy` is the FILING's fiscal year, so a 10-K filed in 2025 tags
+  its FY2024, FY2023 and FY2022 comparatives all as fy=2025. v1 collapsed
+  them into one slot.
 
-v2 fixes this by:
-  1. Deriving the fiscal year from each fact's `end` (period end) date.
-  2. Deduplicating on the exact period_end date, keeping the most recently
-     FILED value - which is the correct handling of genuine restatements.
-  3. Auditing EVERY candidate R&D tag per company rather than silently taking
-     the first that works, so tag-comparability problems are visible.
-  4. Printing the last 8 years of actual values so the output can be
-     eyeballed against reality.
-  5. Attributing trials only to sponsor strings that actually belong to the
-     company, and emitting those strings as sponsor_aliases seed rows.
+v2 -> v3:
+  1. TAG STITCHING. Companies switch XBRL tags mid-history. Eli Lilly reports
+     ResearchAndDevelopmentExpense through 2022 then switches to
+     ...ExcludingAcquiredInProcessCost; Vertex switches in 2021. v2 picked one
+     tag and silently discarded the rest of the series. v3 stitches the two
+     into a single series and records which tag supplied each year.
+  2. ALLOWLIST INSTEAD OF AUTO-DISCOVERY. v2 discovered any tag containing
+     "ResearchAndDevelopment", which pulled in
+     IncomeTaxReconciliationNondeductibleExpenseResearchAndDevelopment (a tax
+     reconciliation line), PaymentsToAcquireInProcessResearchAndDevelopment (a
+     cash flow item) and ResearchAndDevelopmentInProcess (an IPR&D charge).
+     None are R&D operating expense. Only two tags are now permitted.
+  3. OVERLAP AGREEMENT CHECK. Where both tags cover the same year, the values
+     are compared. Large disagreement means the stitch is unsafe and the
+     company needs a manual decision.
+  4. DIVESTITURE FLAGGING. Sponsor strings describing a spin-off or merger
+     away from the parent (e.g. Pfizer's Upjohn -> Viatris) are excluded from
+     attribution and reported separately for effective-dating review.
+  5. Universe expanded from 5 to 12 companies, and the run now emits
+     ready-to-load seed data for the `companies` and `sponsor_aliases` tables.
 
 Environment variables:
   SEC_USER_AGENT  (required)  e.g. "PharmaPulse Research you@example.com"
@@ -28,6 +37,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -39,21 +49,60 @@ import requests
 
 
 # --------------------------------------------------------------------------
-# Configuration
+# Company universe
 # --------------------------------------------------------------------------
+# `alias_keywords` are lowercase substrings that identify a lead-sponsor string
+# as belonging to this company, including known acquired subsidiaries.
+# Keep them specific: "merck sharp" not "merck", or Merck KGaA / EMD Serono
+# (an unrelated German company) gets swept in.
 
 TEST_COMPANIES: List[Dict[str, Any]] = [
-    {"ticker": "PFE",  "name": "Pfizer",    "ctgov_query": "Pfizer",
-     "alias_keywords": ["pfizer", "wyeth", "seagen", "array biopharma", "hospira"]},
-    {"ticker": "MRK",  "name": "Merck",     "ctgov_query": "Merck Sharp Dohme",
-     "alias_keywords": ["merck sharp", "merck & co", "arqule", "organon"]},
-    {"ticker": "LLY",  "name": "Eli Lilly", "ctgov_query": "Eli Lilly",
+    {"ticker": "PFE", "name": "Pfizer", "ctgov_query": "Pfizer",
+     "alias_keywords": ["pfizer", "wyeth", "seagen", "array biopharma",
+                        "hospira", "metsera"]},
+    {"ticker": "MRK", "name": "Merck & Co", "ctgov_query": "Merck Sharp Dohme",
+     "alias_keywords": ["merck sharp", "merck & co", "arqule", "organon",
+                        "novacardia", "immune design", "acceleron",
+                        "prometheus biosciences"]},
+    {"ticker": "LLY", "name": "Eli Lilly", "ctgov_query": "Eli Lilly",
      "alias_keywords": ["eli lilly", "loxo oncology", "dice therapeutics",
-                        "dermira", "morphic therapeutic"]},
-    {"ticker": "VRTX", "name": "Vertex",    "ctgov_query": "Vertex Pharmaceuticals",
+                        "dermira", "morphic therapeutic", "point biopharma",
+                        "scorpion therapeutics"]},
+    {"ticker": "ABBV", "name": "AbbVie", "ctgov_query": "AbbVie",
+     "alias_keywords": ["abbvie", "allergan", "pharmacyclics", "stemcentrx",
+                        "cerevel", "immunogen"]},
+    {"ticker": "BMY", "name": "Bristol-Myers Squibb",
+     "ctgov_query": "Bristol-Myers Squibb",
+     "alias_keywords": ["bristol-myers squibb", "bristol myers squibb",
+                        "celgene", "juno therapeutics", "mirati",
+                        "karuna therapeutics", "rayzebio", "turning point therapeutics"]},
+    {"ticker": "AMGN", "name": "Amgen", "ctgov_query": "Amgen",
+     "alias_keywords": ["amgen", "horizon therapeutics", "onyx pharmaceuticals",
+                        "five prime", "chemocentryx"]},
+    {"ticker": "GILD", "name": "Gilead Sciences", "ctgov_query": "Gilead Sciences",
+     "alias_keywords": ["gilead", "kite pharma", "immunomedics", "forty seven",
+                        "cymabay"]},
+    {"ticker": "REGN", "name": "Regeneron", "ctgov_query": "Regeneron",
+     "alias_keywords": ["regeneron"]},
+    {"ticker": "VRTX", "name": "Vertex Pharmaceuticals",
+     "ctgov_query": "Vertex Pharmaceuticals",
      "alias_keywords": ["vertex pharmaceuticals"]},
-    {"ticker": "INCY", "name": "Incyte",    "ctgov_query": "Incyte",
+    {"ticker": "INCY", "name": "Incyte", "ctgov_query": "Incyte",
      "alias_keywords": ["incyte"]},
+    {"ticker": "BIIB", "name": "Biogen", "ctgov_query": "Biogen",
+     "alias_keywords": ["biogen", "reata pharmaceuticals",
+                        "human genome sciences"]},
+    {"ticker": "MRNA", "name": "Moderna", "ctgov_query": "ModernaTX",
+     "alias_keywords": ["moderna"]},
+]
+
+# Sponsor strings matching these describe an entity that LEFT the parent.
+# They are excluded from attribution and reported for effective-dating review.
+DIVESTITURE_MARKERS = [
+    "viatris",
+    "has merged with",
+    "spun off",
+    "now part of",
 ]
 
 PHASE_WEIGHTS: Dict[str, float] = {
@@ -63,19 +112,18 @@ PHASE_WEIGHTS: Dict[str, float] = {
     "PHASE3": 9.0,
     "PHASE4": 2.0,
 }
-
 PHASE_RANK = ["EARLY_PHASE1", "PHASE1", "PHASE2", "PHASE3", "PHASE4"]
 
-RD_TAG_PRIMARY = "ResearchAndDevelopmentExpense"
-RD_TAG_CANDIDATES = [
-    RD_TAG_PRIMARY,
-    "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
-]
+# ONLY these two tags are R&D operating expense. No auto-discovery.
+TAG_PRIMARY = "ResearchAndDevelopmentExpense"
+TAG_EXCL_IPRD = "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost"
+ALLOWED_RD_TAGS = [TAG_PRIMARY, TAG_EXCL_IPRD]
 
 DEFAULT_LAG_YEARS = 2
 ANALYSIS_START_YEAR = 2014
 ANALYSIS_END_YEAR = 2024
 MIN_YEARS_REQUIRED = 8
+OVERLAP_TOLERANCE = 0.02  # 2% relative difference is treated as agreement
 
 SEC_THROTTLE_SECONDS = 0.25
 CTGOV_THROTTLE_SECONDS = 1.5
@@ -177,11 +225,11 @@ def _parse_iso(d: Any) -> Optional[date]:
 
 def fiscal_year_from_period_end(end: date) -> int:
     """
-    Assign a fiscal year label from the period END date.
+    Fiscal year label from the period END date.
 
-    A period ending Jun-Dec belongs to that calendar year. A period ending
-    Jan-May belongs to the previous calendar year, since most of the period
-    fell in it. This is what makes a Dec-FYE filer comparable to a Jan-FYE one.
+    Ending Jun-Dec -> that calendar year. Ending Jan-May -> previous calendar
+    year, since most of the period fell in it. Makes Dec-FYE and Jan-FYE
+    filers comparable.
     """
     return end.year if end.month >= 6 else end.year - 1
 
@@ -190,15 +238,11 @@ def extract_tag_series(
     facts: Dict[str, Any], tag: str
 ) -> Tuple[Dict[int, Dict[str, Any]], int]:
     """
-    Extract annual 10-K values for one XBRL tag.
+    Annual 10-K values for one XBRL tag.
 
-    Returns (by_fiscal_year, value_changing_restatement_count).
-
-    Cleaning rules:
-      - form == 10-K only
-      - annual duration only (350-380 days)
-      - fiscal year derived from the period END date, never the `fy` field
-      - deduplicated on exact period_end, keeping the most recently filed value
+    Rules: 10-K only; annual duration (350-380 days); fiscal year from the
+    period END date; deduplicated on exact period_end keeping the most
+    recently FILED value. Returns (by_fiscal_year, value_changing_restatements).
     """
     node = facts.get("facts", {}).get("us-gaap", {}).get(tag)
     if not node:
@@ -219,7 +263,6 @@ def extract_tag_series(
         end = _parse_iso(rec.get("end"))
         if not start or not end:
             continue
-
         if not (350 <= (end - start).days <= 380):
             continue
 
@@ -235,8 +278,6 @@ def extract_tag_series(
             if existing["value"] != val:
                 restatements += 1
                 was_restated = True
-                # Mark the retained record too - the filings disagree on this
-                # period regardless of which one we end up keeping.
                 existing["restated"] = True
             else:
                 was_restated = existing["restated"]
@@ -264,41 +305,72 @@ def extract_tag_series(
     return by_year, restatements
 
 
-def audit_all_tags(facts: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """Run extraction for every candidate tag so coverage can be compared."""
-    us_gaap = facts.get("facts", {}).get("us-gaap", {})
-    discovered = [
-        t for t in us_gaap
-        if "ResearchAndDevelopment" in t
-        and not any(x in t for x in ("Asset", "Liability", "Payable", "Number"))
-    ]
-    tags = list(dict.fromkeys(RD_TAG_CANDIDATES + discovered))
+def stitch_rd_series(
+    facts: Dict[str, Any]
+) -> Tuple[Dict[int, Dict[str, Any]], Dict[str, Any]]:
+    """
+    Build one continuous R&D series from the two allowed tags.
 
-    results: Dict[str, Dict[str, Any]] = {}
-    for tag in tags:
-        series, restatements = extract_tag_series(facts, tag)
-        if not series:
-            continue
-        in_window = [y for y in series if ANALYSIS_START_YEAR <= y <= ANALYSIS_END_YEAR]
-        results[tag] = {
-            "series": series,
-            "restatements": restatements,
-            "years_total": len(series),
-            "years_in_window": len(in_window),
-            "min_year": min(series),
-            "max_year": max(series),
-        }
-    return results
+    Companies switch tags mid-history, so neither tag alone covers the full
+    period. The primary tag wins where present; the IPR&D-excluding tag fills
+    the remaining years. Each year records which tag supplied it.
 
+    Also compares the two tags on overlapping years. Disagreement above
+    OVERLAP_TOLERANCE means the stitch splices together two different
+    definitions and the company needs a manual decision.
+    """
+    per_tag: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    restatements: Dict[str, int] = {}
 
-def choose_tag(audit: Dict[str, Dict[str, Any]]) -> Optional[str]:
-    """Prefer the primary tag when coverage is adequate; else the widest."""
-    if not audit:
-        return None
-    primary = audit.get(RD_TAG_PRIMARY)
-    if primary and primary["years_in_window"] >= MIN_YEARS_REQUIRED:
-        return RD_TAG_PRIMARY
-    return max(audit.items(), key=lambda kv: kv[1]["years_in_window"])[0]
+    for tag in ALLOWED_RD_TAGS:
+        series, rest = extract_tag_series(facts, tag)
+        if series:
+            per_tag[tag] = series
+            restatements[tag] = rest
+
+    primary = per_tag.get(TAG_PRIMARY, {})
+    excl = per_tag.get(TAG_EXCL_IPRD, {})
+
+    stitched: Dict[int, Dict[str, Any]] = {}
+    for year in sorted(set(primary) | set(excl)):
+        if year in primary:
+            rec = dict(primary[year])
+            rec["tag"] = TAG_PRIMARY
+        else:
+            rec = dict(excl[year])
+            rec["tag"] = TAG_EXCL_IPRD
+        stitched[year] = rec
+
+    overlap_years = sorted(set(primary) & set(excl))
+    disagreements: List[Tuple[int, float, float, float]] = []
+    for year in overlap_years:
+        a = primary[year]["value"]
+        b = excl[year]["value"]
+        denom = max(abs(a), abs(b), 1.0)
+        rel = abs(a - b) / denom
+        if rel > OVERLAP_TOLERANCE:
+            disagreements.append((year, a, b, rel))
+
+    tags_used = sorted({r["tag"] for r in stitched.values()})
+
+    diagnostics = {
+        "per_tag_coverage": {
+            tag: {
+                "years": len(s),
+                "min_year": min(s),
+                "max_year": max(s),
+                "in_window": len([y for y in s
+                                  if ANALYSIS_START_YEAR <= y <= ANALYSIS_END_YEAR]),
+                "restatements": restatements.get(tag, 0),
+            }
+            for tag, s in per_tag.items()
+        },
+        "overlap_years": overlap_years,
+        "disagreements": disagreements,
+        "tags_used": tags_used,
+        "is_spliced": len(tags_used) > 1,
+    }
+    return stitched, diagnostics
 
 
 # --------------------------------------------------------------------------
@@ -379,12 +451,20 @@ def parse_start_year(proto: Dict[str, Any]) -> Tuple[Optional[int], bool]:
         return None, True
 
 
+def is_divestiture(name: str) -> bool:
+    low = name.lower()
+    return any(m in low for m in DIVESTITURE_MARKERS)
+
+
 def summarise_studies(
     studies: List[Dict[str, Any]], alias_keywords: List[str]
 ) -> Dict[str, Any]:
-    """Only counts trials whose LEAD sponsor string belongs to this company."""
-    sponsor_counter: Counter = Counter()
-    sponsor_class: Dict[str, str] = {}
+    """
+    Attributes a trial to the company only when the LEAD sponsor string matches
+    one of its name patterns and is not a divested entity.
+    """
+    counter: Counter = Counter()
+    klass_map: Dict[str, str] = {}
     by_year_phase: Dict[int, Counter] = defaultdict(Counter)
     inferred = 0
     matched = 0
@@ -407,10 +487,10 @@ def summarise_studies(
         if not name:
             continue
 
-        sponsor_counter[name] += 1
-        sponsor_class[name] = klass
+        counter[name] += 1
+        klass_map[name] = klass
 
-        if klass != "INDUSTRY" or not is_ours(name):
+        if klass != "INDUSTRY" or not is_ours(name) or is_divestiture(name):
             continue
 
         matched += 1
@@ -421,17 +501,18 @@ def summarise_studies(
             continue
         by_year_phase[year][assign_phase(design.get("phases"))] += 1
 
-    alias_candidates = [
-        (n, c) for n, c in sponsor_counter.most_common()
-        if sponsor_class.get(n) == "INDUSTRY" and is_ours(n)
-    ]
+    ours = [(n, c) for n, c in counter.most_common()
+            if klass_map.get(n) == "INDUSTRY" and is_ours(n)]
+    aliases = [(n, c) for n, c in ours if not is_divestiture(n)]
+    divested = [(n, c) for n, c in ours if is_divestiture(n)]
 
     return {
         "total_returned": len(studies),
         "matched_trials": matched,
         "by_year_phase": by_year_phase,
         "inferred_dates": inferred,
-        "alias_candidates": alias_candidates,
+        "alias_candidates": aliases,
+        "divested_candidates": divested,
     }
 
 
@@ -451,6 +532,10 @@ def fmt_usd(v: Optional[float]) -> str:
     return f"${v / 1e6:,.0f}M"
 
 
+def esc(s: str) -> str:
+    return s.replace("|", chr(92) + "|")
+
+
 def main() -> int:
     out: List[str] = []
 
@@ -466,17 +551,18 @@ def main() -> int:
 
     sec_headers = {"User-Agent": ua, "Accept-Encoding": "gzip, deflate"}
 
-    w("# PharmaPulse - Phase 0 Feasibility Report (v2, corrected)")
+    w("# PharmaPulse - Phase 0 Feasibility Report (v3, final)")
     w()
     w(f"Generated: {datetime.utcnow().isoformat(timespec='seconds')}Z")
+    w(f"Universe: {len(TEST_COMPANIES)} companies")
     w()
-    w("> v1 derived fiscal years from XBRL's `fy` field, which is the FILING's")
-    w("> fiscal year, not the data point's. That collapsed several years into")
-    w("> one slot. v2 derives the year from each fact's period END date.")
+    w("> v3 stitches the two permitted R&D tags into one continuous series,")
+    w("> restricts tags to an explicit allowlist, checks tag agreement on")
+    w("> overlapping years, and excludes divested entities from attribution.")
     w()
 
     # ---- Q1 --------------------------------------------------------------
-    w("## Q1. SEC EDGAR - R&D tag coverage and values")
+    w("## Q1. SEC EDGAR - stitched R&D series")
     w()
 
     try:
@@ -488,18 +574,19 @@ def main() -> int:
     w()
 
     financials: Dict[str, Dict[int, Dict[str, Any]]] = {}
-    chosen_tags: Dict[str, str] = {}
+    diags: Dict[str, Dict[str, Any]] = {}
+    ciks: Dict[str, str] = {}
+
+    w("| Company | Ticker | Years 2014-2024 | Range | Tags used | Spliced | Overlap conflicts |")
+    w("|---|---|---|---|---|---|---|")
 
     for company in TEST_COMPANIES:
         ticker, cname = company["ticker"], company["name"]
         cik = ticker_map.get(ticker)
-        w(f"### {cname} ({ticker})")
-        w()
-
         if not cik:
-            w("Ticker not found in the SEC ticker map.")
-            w()
+            w(f"| {cname} | {ticker} | - | - | TICKER NOT FOUND | - | - |")
             continue
+        ciks[ticker] = cik
 
         try:
             facts = http_get_json(
@@ -508,48 +595,71 @@ def main() -> int:
                 label=f"companyfacts {cik}",
             )
         except SpikeError as exc:
-            w(f"ERROR: {exc}")
-            w()
+            w(f"| {cname} | {ticker} | - | - | ERROR | - | - |")
+            print(f"    {exc}", file=sys.stderr)
             continue
 
         if not facts:
-            w("No company facts returned.")
-            w()
+            w(f"| {cname} | {ticker} | - | - | NO FACTS | - | - |")
             continue
 
-        audit = audit_all_tags(facts)
-        if not audit:
-            w("No usable R&D tags found.")
-            w()
+        series, diag = stitch_rd_series(facts)
+        if not series:
+            w(f"| {cname} | {ticker} | 0 | - | NONE FOUND | - | - |")
             continue
 
-        w(f"CIK {cik}. Candidate R&D tags:")
+        financials[ticker] = series
+        diags[ticker] = diag
+
+        in_window = len([y for y in series
+                         if ANALYSIS_START_YEAR <= y <= ANALYSIS_END_YEAR])
+        short_tags = ", ".join(
+            "primary" if t == TAG_PRIMARY else "excl-IPRD" for t in diag["tags_used"]
+        )
+        w(f"| {cname} | {ticker} | {in_window} | {min(series)}-{max(series)} | "
+          f"{short_tags} | {'yes' if diag['is_spliced'] else 'no'} | "
+          f"{len(diag['disagreements'])} |")
+
+    w()
+
+    # Detail per company
+    for company in TEST_COMPANIES:
+        ticker = company["ticker"]
+        if ticker not in financials:
+            continue
+        series, diag = financials[ticker], diags[ticker]
+
+        w(f"### {company['name']} ({ticker}) - CIK {ciks.get(ticker, '?')}")
         w()
         w("| Tag | Years | In 2014-2024 | Range | Restatements |")
         w("|---|---|---|---|---|")
-        for tag, info in sorted(audit.items(),
-                                key=lambda kv: kv[1]["years_in_window"], reverse=True):
-            w(f"| {tag} | {info['years_total']} | {info['years_in_window']} | "
+        for tag, info in diag["per_tag_coverage"].items():
+            label = "primary" if tag == TAG_PRIMARY else "excl-IPRD"
+            w(f"| {label} | {info['years']} | {info['in_window']} | "
               f"{info['min_year']}-{info['max_year']} | {info['restatements']} |")
         w()
 
-        tag = choose_tag(audit)
-        chosen_tags[ticker] = tag
-        financials[ticker] = audit[tag]["series"]
-
-        if tag != RD_TAG_PRIMARY:
-            w(f"**Selected `{tag}` rather than the primary tag.** Comparability "
-              "flag: values on different tags are not directly comparable "
-              "across companies.")
+        if diag["disagreements"]:
+            w("**Tag conflict on overlapping years.** The two tags report "
+              "materially different values for the same period, so splicing "
+              "them mixes definitions. This company needs a manual decision:")
+            w()
+            w("| Year | Primary | Excl-IPRD | Difference |")
+            w("|---|---|---|---|")
+            for y, a, b, rel in diag["disagreements"]:
+                w(f"| {y} | {fmt_usd(a)} | {fmt_usd(b)} | {rel * 100:.1f}% |")
+            w()
+        elif diag["overlap_years"]:
+            w(f"Tags agree on all {len(diag['overlap_years'])} overlapping "
+              "years. Splice is safe.")
             w()
 
-        w("Last 8 fiscal years (sanity-check against reality):")
-        w()
-        w("| Fiscal year | Period end | R&D expense | Restated |")
-        w("|---|---|---|---|")
-        for y in sorted(financials[ticker])[-8:]:
-            r = financials[ticker][y]
-            w(f"| {y} | {r['period_end']} | {fmt_usd(r['value'])} | "
+        w("| Fiscal year | Period end | R&D expense | Tag | Restated |")
+        w("|---|---|---|---|---|")
+        for y in sorted(series)[-10:]:
+            r = series[y]
+            label = "primary" if r["tag"] == TAG_PRIMARY else "excl-IPRD"
+            w(f"| {y} | {r['period_end']} | {fmt_usd(r['value'])} | {label} | "
               f"{'yes' if r['restated'] else 'no'} |")
         w()
 
@@ -559,27 +669,27 @@ def main() -> int:
         >= MIN_YEARS_REQUIRED
     )
     w(f"**Q1 VERDICT:** {covered} of {len(TEST_COMPANIES)} companies have "
-      f"{MIN_YEARS_REQUIRED}+ years in {ANALYSIS_START_YEAR}-{ANALYSIS_END_YEAR}. "
-      "Pass condition: 4 of 5.")
+      f"{MIN_YEARS_REQUIRED}+ years in {ANALYSIS_START_YEAR}-{ANALYSIS_END_YEAR}.")
+    w("Pass condition: 10 of 12.")
     w()
 
-    mismatched = [t for t, tag in chosen_tags.items() if tag != RD_TAG_PRIMARY]
-    if mismatched:
-        w(f"**Tag comparability warning:** {', '.join(mismatched)} use a "
-          "non-primary tag. Cross-company ratios involving them need a UI caveat.")
-        w()
-
+    spliced = [t for t, d in diags.items() if d["is_spliced"]]
+    conflicted = [t for t, d in diags.items() if d["disagreements"]]
+    if spliced:
+        w(f"- Spliced series (two tags stitched): {', '.join(spliced)}")
+    if conflicted:
+        w(f"- **Needs manual decision (tag conflict): {', '.join(conflicted)}**")
+    w()
     w("---")
     w()
 
     # ---- Q2 --------------------------------------------------------------
     w("## Q2. ClinicalTrials.gov - sponsor aliases")
     w()
-    w("Only lead sponsors matching this company's name patterns are counted. "
-      "These tables are the seed rows for `sponsor_aliases`.")
-    w()
 
     trial_data: Dict[str, Dict[str, Any]] = {}
+    all_alias_rows: List[Tuple[str, str, int]] = []
+    all_divested: List[Tuple[str, str, int]] = []
 
     for company in TEST_COMPANIES:
         ticker = company["ticker"]
@@ -587,9 +697,7 @@ def main() -> int:
         try:
             studies = fetch_ctgov_studies(company["ctgov_query"])
         except SpikeError as exc:
-            w(f"### {company['name']} ({ticker})")
-            w()
-            w(f"ERROR: {exc}")
+            w(f"### {company['name']} ({ticker}) - ERROR: {exc}")
             w()
             continue
 
@@ -597,40 +705,60 @@ def main() -> int:
         trial_data[ticker] = summary
 
         aliases = summary["alias_candidates"]
+        divested = summary["divested_candidates"]
         total = sum(c for _, c in aliases)
         top_share = (aliases[0][1] / total * 100) if aliases and total else 0.0
 
+        for name, count in aliases:
+            all_alias_rows.append((ticker, name, count))
+        for name, count in divested:
+            all_divested.append((ticker, name, count))
+
         w(f"### {company['name']} ({ticker})")
         w()
-        w(f"- Trials attributed to this company: **{summary['matched_trials']:,}**")
-        w(f"- Distinct sponsor strings: **{len(aliases)}**")
-        w(f"- Share captured by the exact-name string: **{top_share:.1f}%**")
-        w(f"- Trials needing an inferred start date: **{summary['inferred_dates']:,}**")
+        w(f"- Attributed trials: **{summary['matched_trials']:,}** | "
+          f"alias strings: **{len(aliases)}** | "
+          f"exact-name share: **{top_share:.1f}%** | "
+          f"inferred dates: **{summary['inferred_dates']:,}**")
         w()
         w("| Sponsor string (verbatim) | Trials |")
         w("|---|---|")
-        for name, count in aliases[:15]:
-            w(f"| {name.replace('|', chr(92) + '|')} | {count} |")
-        if len(aliases) > 15:
-            w(f"| _...and {len(aliases) - 15} more_ | |")
+        for name, count in aliases[:12]:
+            w(f"| {esc(name)} | {count} |")
+        if len(aliases) > 12:
+            w(f"| _...and {len(aliases) - 12} more_ | |")
         w()
 
+        if divested:
+            w("Excluded as divested / spun off (needs effective-dating review):")
+            w()
+            w("| Sponsor string | Trials |")
+            w("|---|---|")
+            for name, count in divested:
+                w(f"| {esc(name)} | {count} |")
+            w()
+
+    w(f"**Q2 VERDICT:** {len(all_alias_rows)} alias rows across "
+      f"{len(trial_data)} companies. This is the manual curation workload.")
+    w()
     w("---")
     w()
 
     # ---- Q3 --------------------------------------------------------------
-    w("## Q3. Efficiency metric spread (recomputed on corrected financials)")
+    w("## Q3. Efficiency metric spread")
     w()
     w(f"Phase-weighted trial starts in year Y / R&D in year Y-{DEFAULT_LAG_YEARS}, per $1M.")
     w(f"Weights: {', '.join(f'{k}={v}' for k, v in PHASE_WEIGHTS.items())} "
       "(assumptions, not measured values).")
     w()
 
-    years = list(range(2018, 2025))
+    years = list(range(2017, 2025))
     w("| Company | " + " | ".join(str(y) for y in years) + " |")
     w("|---" * (len(years) + 1) + "|")
 
     all_ratios: List[float] = []
+    latest_by_company: List[Tuple[str, float]] = []
+
     for company in TEST_COMPANIES:
         ticker = company["ticker"]
         byp = trial_data.get(ticker, {}).get("by_year_phase", {})
@@ -644,28 +772,65 @@ def main() -> int:
                 continue
             ratio = weighted_output(counts) / (rd["value"] / 1e6)
             all_ratios.append(ratio)
+            if y == 2024:
+                latest_by_company.append((company["name"], ratio))
             cells.append(f"{ratio:.4f}")
         w(f"| {company['name']} | " + " | ".join(cells) + " |")
 
     w()
-    if len(all_ratios) >= 5:
+    if len(all_ratios) >= 10:
         lo, hi = min(all_ratios), max(all_ratios)
         srt = sorted(all_ratios)
         med = srt[len(srt) // 2]
         spread = hi / lo if lo > 0 else float("inf")
-        w(f"- Observations: **{len(all_ratios)}**  |  Min / median / max: "
-          f"**{lo:.4f} / {med:.4f} / {hi:.4f}**  |  Max-to-min: **{spread:.1f}x**")
+        w(f"- Observations: **{len(all_ratios)}** | Min / median / max: "
+          f"**{lo:.4f} / {med:.4f} / {hi:.4f}** | Max-to-min: **{spread:.1f}x**")
         w()
+        if latest_by_company:
+            latest_by_company.sort(key=lambda kv: kv[1], reverse=True)
+            w("2024 ranking:")
+            w()
+            for i, (nm, r) in enumerate(latest_by_company, 1):
+                w(f"{i}. {nm} - {r:.4f}")
+            w()
         if spread >= 3:
             w("**Q3 VERDICT: PASS.** Real variation between companies.")
         elif spread >= 1.8:
-            w("**Q3 VERDICT: MARGINAL.** Weak spread. Consider reframing around "
-              "pipeline mix over time rather than cross-company ranking.")
+            w("**Q3 VERDICT: MARGINAL.** Reframe around pipeline mix over time.")
         else:
-            w("**Q3 VERDICT: FAIL.** No cross-company story. Reframe before UI.")
+            w("**Q3 VERDICT: FAIL.** No cross-company story.")
     else:
         w("**Q3 VERDICT: INCONCLUSIVE.** Too few computable company-years.")
 
+    w()
+    w("---")
+    w()
+
+    # ---- Seed data -------------------------------------------------------
+    w("## Seed data for the database")
+    w()
+    w("Copy these blocks. They load directly into `companies` and "
+      "`sponsor_aliases` in the next step.")
+    w()
+    w("### companies")
+    w()
+    w("```csv")
+    w("ticker,cik,name")
+    for company in TEST_COMPANIES:
+        t = company["ticker"]
+        if t in ciks:
+            w(f"{t},{ciks[t]},\"{company['name']}\"")
+    w("```")
+    w()
+    w("### sponsor_aliases")
+    w()
+    w("```csv")
+    w("ticker,sponsor_name,trial_count,status")
+    for ticker, name, count in all_alias_rows:
+        w(f"{ticker},\"{name}\",{count},active")
+    for ticker, name, count in all_divested:
+        w(f"{ticker},\"{name}\",{count},needs_effective_dating")
+    w("```")
     w()
     w("---")
     w()
@@ -673,6 +838,28 @@ def main() -> int:
 
     with open("phase0_report.md", "w", encoding="utf-8") as fh:
         fh.write("\n".join(out))
+
+    with open("seed_data.json", "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "companies": [
+                    {"ticker": c["ticker"], "cik": ciks.get(c["ticker"]),
+                     "name": c["name"]}
+                    for c in TEST_COMPANIES if c["ticker"] in ciks
+                ],
+                "aliases": [
+                    {"ticker": t, "sponsor_name": n, "trial_count": c,
+                     "status": "active"}
+                    for t, n, c in all_alias_rows
+                ] + [
+                    {"ticker": t, "sponsor_name": n, "trial_count": c,
+                     "status": "needs_effective_dating"}
+                    for t, n, c in all_divested
+                ],
+            },
+            fh, indent=2,
+        )
+
     return 0
 
 
