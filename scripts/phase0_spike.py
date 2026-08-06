@@ -1,18 +1,26 @@
 """
-PharmaPulse - Phase 0 Feasibility Spike
-=======================================
+PharmaPulse - Phase 0 Feasibility Spike (v2, corrected)
+=======================================================
 
-Answers three questions before any schema or UI is built:
+CHANGES FROM v1 - and why they matter
+-------------------------------------
+v1 derived the fiscal year from XBRL's `fy` field. That field is the fiscal
+year of the FILING, not of the data point. A 10-K filed in 2025 contains
+comparative figures for FY2024, FY2023 and FY2022, and every one of them is
+tagged fy=2025, fp=FY, form=10-K. v1 therefore collapsed three distinct years
+into one slot and kept whichever record it happened to see first. The "34
+duplicate fiscal-year records" it reported were the symptom, not restatements.
 
-  Q1. Does the XBRL tag ResearchAndDevelopmentExpense exist for our test
-      companies, with usable annual 10-K values over ~10 years?
-  Q2. What are the REAL ClinicalTrials.gov lead-sponsor name variants for each
-      company? (This output becomes the seed data for the sponsor_aliases table.)
-  Q3. Does the capital-efficiency metric produce a useful spread across
-      companies, or does everyone land in the same narrow band?
-
-Runs in GitHub Actions. Requires no local setup.
-Writes a human-readable report to phase0_report.md and prints it to the log.
+v2 fixes this by:
+  1. Deriving the fiscal year from each fact's `end` (period end) date.
+  2. Deduplicating on the exact period_end date, keeping the most recently
+     FILED value - which is the correct handling of genuine restatements.
+  3. Auditing EVERY candidate R&D tag per company rather than silently taking
+     the first that works, so tag-comparability problems are visible.
+  4. Printing the last 8 years of actual values so the output can be
+     eyeballed against reality.
+  5. Attributing trials only to sponsor strings that actually belong to the
+     company, and emitting those strings as sponsor_aliases seed rows.
 
 Environment variables:
   SEC_USER_AGENT  (required)  e.g. "PharmaPulse Research you@example.com"
@@ -20,7 +28,6 @@ Environment variables:
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import time
@@ -35,19 +42,20 @@ import requests
 # Configuration
 # --------------------------------------------------------------------------
 
-# Test universe: 3 large-cap pharma + 2 mid-cap biotech.
-# The mid-caps are deliberate - XBRL tag coverage and sponsor naming are
-# usually messier for smaller filers, which is exactly what we need to learn.
-TEST_COMPANIES: List[Dict[str, str]] = [
-    {"ticker": "PFE",  "name": "Pfizer",            "ctgov_query": "Pfizer"},
-    {"ticker": "MRK",  "name": "Merck",             "ctgov_query": "Merck Sharp Dohme"},
-    {"ticker": "LLY",  "name": "Eli Lilly",         "ctgov_query": "Eli Lilly"},
-    {"ticker": "VRTX", "name": "Vertex",            "ctgov_query": "Vertex Pharmaceuticals"},
-    {"ticker": "INCY", "name": "Incyte",            "ctgov_query": "Incyte"},
+TEST_COMPANIES: List[Dict[str, Any]] = [
+    {"ticker": "PFE",  "name": "Pfizer",    "ctgov_query": "Pfizer",
+     "alias_keywords": ["pfizer", "wyeth", "seagen", "array biopharma", "hospira"]},
+    {"ticker": "MRK",  "name": "Merck",     "ctgov_query": "Merck Sharp Dohme",
+     "alias_keywords": ["merck sharp", "merck & co", "arqule", "organon"]},
+    {"ticker": "LLY",  "name": "Eli Lilly", "ctgov_query": "Eli Lilly",
+     "alias_keywords": ["eli lilly", "loxo oncology", "dice therapeutics",
+                        "dermira", "morphic therapeutic"]},
+    {"ticker": "VRTX", "name": "Vertex",    "ctgov_query": "Vertex Pharmaceuticals",
+     "alias_keywords": ["vertex pharmaceuticals"]},
+    {"ticker": "INCY", "name": "Incyte",    "ctgov_query": "Incyte",
+     "alias_keywords": ["incyte"]},
 ]
 
-# Phase weights from the engineering spec. These are ASSUMPTIONS reflecting
-# rough relative trial cost, not measured values.
 PHASE_WEIGHTS: Dict[str, float] = {
     "EARLY_PHASE1": 0.5,
     "PHASE1": 1.0,
@@ -59,38 +67,37 @@ PHASE_WEIGHTS: Dict[str, float] = {
 PHASE_RANK = ["EARLY_PHASE1", "PHASE1", "PHASE2", "PHASE3", "PHASE4"]
 
 RD_TAG_PRIMARY = "ResearchAndDevelopmentExpense"
-RD_TAG_FALLBACKS = [
+RD_TAG_CANDIDATES = [
+    RD_TAG_PRIMARY,
     "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
-    "ResearchAndDevelopmentExpenseSoftwareExcludingAcquiredInProcessCost",
 ]
 
 DEFAULT_LAG_YEARS = 2
 ANALYSIS_START_YEAR = 2014
 ANALYSIS_END_YEAR = 2024
+MIN_YEARS_REQUIRED = 8
 
-SEC_THROTTLE_SECONDS = 0.25    # 4 req/s, well under the documented 10 req/s ceiling
-CTGOV_THROTTLE_SECONDS = 1.5   # conservative against ~50 req/min
-CTGOV_MAX_PAGES = 12           # safety cap: 12 x 1000 = 12k studies per company
+SEC_THROTTLE_SECONDS = 0.25
+CTGOV_THROTTLE_SECONDS = 1.5
+CTGOV_MAX_PAGES = 12
 REQUEST_TIMEOUT = 60
 
-
-# --------------------------------------------------------------------------
-# HTTP helpers
-# --------------------------------------------------------------------------
 
 class SpikeError(Exception):
     pass
 
 
+# --------------------------------------------------------------------------
+# HTTP
+# --------------------------------------------------------------------------
+
 def get_user_agent() -> str:
     ua = os.environ.get("SEC_USER_AGENT", "").strip()
     if not ua or "@" not in ua:
         raise SpikeError(
-            "SEC_USER_AGENT is missing or has no email address in it.\n"
-            "The SEC rejects requests without a descriptive User-Agent containing "
-            "contact info.\n"
+            "SEC_USER_AGENT is missing or contains no email address.\n"
             "Set it as a GitHub Actions secret, for example:\n"
-            '  PharmaPulse Research yourname@example.com'
+            "  PharmaPulse Research yourname@example.com"
         )
     return ua
 
@@ -103,14 +110,12 @@ def http_get_json(
     max_attempts: int = 5,
     label: str = "",
 ) -> Optional[Any]:
-    """GET with exponential backoff. Returns parsed JSON, or None on 404."""
     delay = 2.0
     for attempt in range(1, max_attempts + 1):
         time.sleep(throttle)
         try:
-            resp = requests.get(
-                url, headers=headers, params=params, timeout=REQUEST_TIMEOUT
-            )
+            resp = requests.get(url, headers=headers, params=params,
+                                timeout=REQUEST_TIMEOUT)
         except requests.RequestException as exc:
             if attempt == max_attempts:
                 raise SpikeError(f"{label}: network failure after {attempt} attempts: {exc}")
@@ -128,169 +133,179 @@ def http_get_json(
             return None
 
         if resp.status_code == 403:
-            # SEC blocks on rate-limit violation. Do not retry harder.
             raise SpikeError(
-                f"{label}: HTTP 403 from {url}. This usually means the User-Agent "
-                "was rejected or the IP is temporarily blocked for exceeding the "
-                "rate limit. Wait 10 minutes and re-run."
+                f"{label}: HTTP 403. The User-Agent was rejected or the IP is "
+                "temporarily rate-limited. Wait 10 minutes and re-run."
             )
 
         if resp.status_code in (429, 500, 502, 503, 504):
             if attempt == max_attempts:
-                raise SpikeError(
-                    f"{label}: HTTP {resp.status_code} after {attempt} attempts."
-                )
+                raise SpikeError(f"{label}: HTTP {resp.status_code} after {attempt} attempts.")
             time.sleep(delay)
             delay *= 2
             continue
 
         raise SpikeError(f"{label}: unexpected HTTP {resp.status_code} from {url}")
-
     return None
 
 
 # --------------------------------------------------------------------------
-# Q1 - SEC EDGAR XBRL
+# SEC
 # --------------------------------------------------------------------------
 
 def load_ticker_to_cik(headers: Dict[str, str]) -> Dict[str, str]:
-    """Returns {TICKER: zero-padded 10-digit CIK}."""
     data = http_get_json(
         "https://www.sec.gov/files/company_tickers.json",
-        headers=headers,
-        throttle=SEC_THROTTLE_SECONDS,
-        label="SEC ticker map",
+        headers=headers, throttle=SEC_THROTTLE_SECONDS, label="SEC ticker map",
     )
     if not data:
         raise SpikeError("Could not load the SEC ticker map.")
-
-    mapping: Dict[str, str] = {}
+    out: Dict[str, str] = {}
     for row in data.values():
-        ticker = str(row.get("ticker", "")).upper()
-        cik = str(row.get("cik_str", "")).zfill(10)
-        if ticker:
-            mapping[ticker] = cik
-    return mapping
+        t = str(row.get("ticker", "")).upper()
+        if t:
+            out[t] = str(row.get("cik_str", "")).zfill(10)
+    return out
 
 
-def fetch_company_facts(cik: str, headers: Dict[str, str]) -> Optional[Dict[str, Any]]:
-    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-    return http_get_json(
-        url, headers=headers, throttle=SEC_THROTTLE_SECONDS, label=f"companyfacts {cik}"
-    )
-
-
-def _parse_iso(d: str) -> Optional[date]:
+def _parse_iso(d: Any) -> Optional[date]:
     try:
-        return datetime.strptime(d, "%Y-%m-%d").date()
+        return datetime.strptime(str(d), "%Y-%m-%d").date()
     except (ValueError, TypeError):
         return None
 
 
-def extract_annual_rd(
-    facts: Dict[str, Any]
-) -> Tuple[Dict[int, Dict[str, Any]], Optional[str], List[str]]:
+def fiscal_year_from_period_end(end: date) -> int:
     """
-    Apply every cleaning rule from the spec:
-      - 10-K forms only
+    Assign a fiscal year label from the period END date.
+
+    A period ending Jun-Dec belongs to that calendar year. A period ending
+    Jan-May belongs to the previous calendar year, since most of the period
+    fell in it. This is what makes a Dec-FYE filer comparable to a Jan-FYE one.
+    """
+    return end.year if end.month >= 6 else end.year - 1
+
+
+def extract_tag_series(
+    facts: Dict[str, Any], tag: str
+) -> Tuple[Dict[int, Dict[str, Any]], int]:
+    """
+    Extract annual 10-K values for one XBRL tag.
+
+    Returns (by_fiscal_year, value_changing_restatement_count).
+
+    Cleaning rules:
+      - form == 10-K only
       - annual duration only (350-380 days)
-      - deduplicate by fiscal year, keeping the most recently FILED record
-      - fall back to alternative tags if the primary is absent
-
-    Returns (by_fiscal_year, tag_used, notes)
+      - fiscal year derived from the period END date, never the `fy` field
+      - deduplicated on exact period_end, keeping the most recently filed value
     """
-    notes: List[str] = []
+    node = facts.get("facts", {}).get("us-gaap", {}).get(tag)
+    if not node:
+        return {}, 0
+
+    records = node.get("units", {}).get("USD", [])
+    if not records:
+        return {}, 0
+
+    by_period_end: Dict[date, Dict[str, Any]] = {}
+    restatements = 0
+
+    for rec in records:
+        if rec.get("form") != "10-K":
+            continue
+
+        start = _parse_iso(rec.get("start"))
+        end = _parse_iso(rec.get("end"))
+        if not start or not end:
+            continue
+
+        if not (350 <= (end - start).days <= 380):
+            continue
+
+        val = rec.get("val")
+        if val is None:
+            continue
+
+        filed = _parse_iso(rec.get("filed")) or date.min
+        existing = by_period_end.get(end)
+        was_restated = False
+
+        if existing:
+            if existing["value"] != val:
+                restatements += 1
+                was_restated = True
+                # Mark the retained record too - the filings disagree on this
+                # period regardless of which one we end up keeping.
+                existing["restated"] = True
+            else:
+                was_restated = existing["restated"]
+            if filed <= existing["filed"]:
+                continue
+
+        by_period_end[end] = {
+            "value": val,
+            "period_end": end,
+            "filed": filed,
+            "accession": rec.get("accn"),
+            "restated": was_restated,
+        }
+
+    by_year: Dict[int, Dict[str, Any]] = {}
+    for end, rec in by_period_end.items():
+        fy = fiscal_year_from_period_end(end)
+        prior = by_year.get(fy)
+        if prior and prior["period_end"] >= end:
+            continue
+        rec = dict(rec)
+        rec["fiscal_year"] = fy
+        by_year[fy] = rec
+
+    return by_year, restatements
+
+
+def audit_all_tags(facts: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Run extraction for every candidate tag so coverage can be compared."""
     us_gaap = facts.get("facts", {}).get("us-gaap", {})
-    if not us_gaap:
-        return {}, None, ["No us-gaap facts present in this filing."]
-
-    candidate_tags = [RD_TAG_PRIMARY] + RD_TAG_FALLBACKS
-    # Last resort: any tag whose name mentions research and development.
     discovered = [
-        t for t in us_gaap.keys()
-        if "ResearchAndDevelopment" in t and "Asset" not in t and "Liability" not in t
+        t for t in us_gaap
+        if "ResearchAndDevelopment" in t
+        and not any(x in t for x in ("Asset", "Liability", "Payable", "Number"))
     ]
-    for t in discovered:
-        if t not in candidate_tags:
-            candidate_tags.append(t)
+    tags = list(dict.fromkeys(RD_TAG_CANDIDATES + discovered))
 
-    for tag in candidate_tags:
-        node = us_gaap.get(tag)
-        if not node:
+    results: Dict[str, Dict[str, Any]] = {}
+    for tag in tags:
+        series, restatements = extract_tag_series(facts, tag)
+        if not series:
             continue
-        usd_records = node.get("units", {}).get("USD", [])
-        if not usd_records:
-            continue
+        in_window = [y for y in series if ANALYSIS_START_YEAR <= y <= ANALYSIS_END_YEAR]
+        results[tag] = {
+            "series": series,
+            "restatements": restatements,
+            "years_total": len(series),
+            "years_in_window": len(in_window),
+            "min_year": min(series),
+            "max_year": max(series),
+        }
+    return results
 
-        by_year: Dict[int, Dict[str, Any]] = {}
-        restatement_count = 0
 
-        for rec in usd_records:
-            if rec.get("form") != "10-K":
-                continue
-            if rec.get("fp") != "FY":
-                continue
-
-            start = _parse_iso(rec.get("start", ""))
-            end = _parse_iso(rec.get("end", ""))
-            if not start or not end:
-                continue
-
-            duration = (end - start).days
-            if not (350 <= duration <= 380):
-                continue
-
-            fy = rec.get("fy")
-            if not isinstance(fy, int):
-                continue
-
-            filed = _parse_iso(rec.get("filed", "")) or date.min
-            existing = by_year.get(fy)
-            if existing:
-                restatement_count += 1
-                if filed <= existing["filed"]:
-                    continue
-
-            by_year[fy] = {
-                "value": rec.get("val"),
-                "period_end": end,
-                "filed": filed,
-                "accession": rec.get("accn"),
-                "form": rec.get("form"),
-                "duration_days": duration,
-                "is_restated": existing is not None,
-            }
-
-        if by_year:
-            if tag != RD_TAG_PRIMARY:
-                notes.append(
-                    f"Primary tag absent or empty. Used fallback tag: {tag}"
-                )
-            if restatement_count:
-                notes.append(
-                    f"{restatement_count} duplicate fiscal-year records found "
-                    "(restatements). Kept the most recently filed value for each year."
-                )
-            return by_year, tag, notes
-
-    notes.append(
-        "No usable annual 10-K R&D records found under any candidate tag. "
-        f"Tags present containing 'ResearchAndDevelopment': {discovered or 'none'}"
-    )
-    return {}, None, notes
+def choose_tag(audit: Dict[str, Dict[str, Any]]) -> Optional[str]:
+    """Prefer the primary tag when coverage is adequate; else the widest."""
+    if not audit:
+        return None
+    primary = audit.get(RD_TAG_PRIMARY)
+    if primary and primary["years_in_window"] >= MIN_YEARS_REQUIRED:
+        return RD_TAG_PRIMARY
+    return max(audit.items(), key=lambda kv: kv[1]["years_in_window"])[0]
 
 
 # --------------------------------------------------------------------------
-# Q2 - ClinicalTrials.gov v2
+# ClinicalTrials.gov
 # --------------------------------------------------------------------------
 
 def fetch_ctgov_studies(sponsor_query: str) -> List[Dict[str, Any]]:
-    """
-    Pull all interventional studies matching a sponsor text query.
-    Filtering to INDUSTRY class and interventional type happens in Python
-    rather than via query syntax, so a syntax change upstream cannot silently
-    return zero rows.
-    """
     base = "https://clinicaltrials.gov/api/v2/studies"
     headers = {"Accept": "application/json", "User-Agent": get_user_agent()}
 
@@ -299,11 +314,9 @@ def fetch_ctgov_studies(sponsor_query: str) -> List[Dict[str, Any]]:
         "protocolSection.sponsorCollaboratorsModule.leadSponsor",
         "protocolSection.designModule.phases",
         "protocolSection.designModule.studyType",
-        "protocolSection.designModule.enrollmentInfo",
         "protocolSection.statusModule.overallStatus",
         "protocolSection.statusModule.startDateStruct",
         "protocolSection.statusModule.studyFirstPostDateStruct",
-        "protocolSection.conditionsModule.conditions",
     ])
 
     studies: List[Dict[str, Any]] = []
@@ -312,10 +325,7 @@ def fetch_ctgov_studies(sponsor_query: str) -> List[Dict[str, Any]]:
     pages = 0
 
     while pages < CTGOV_MAX_PAGES:
-        params: Dict[str, Any] = {
-            "query.spons": sponsor_query,
-            "pageSize": 1000,
-        }
+        params: Dict[str, Any] = {"query.spons": sponsor_query, "pageSize": 1000}
         if use_fields:
             params["fields"] = field_paths
         if page_token:
@@ -323,16 +333,11 @@ def fetch_ctgov_studies(sponsor_query: str) -> List[Dict[str, Any]]:
 
         try:
             data = http_get_json(
-                base,
-                headers=headers,
-                params=params,
-                throttle=CTGOV_THROTTLE_SECONDS,
-                label=f"ctgov {sponsor_query}",
+                base, headers=headers, params=params,
+                throttle=CTGOV_THROTTLE_SECONDS, label=f"ctgov {sponsor_query}",
             )
-        except SpikeError as exc:
-            # If the fields syntax is rejected, retry once without it.
+        except SpikeError:
             if use_fields:
-                print(f"    fields parameter rejected ({exc}); retrying without it")
                 use_fields = False
                 continue
             raise
@@ -343,7 +348,6 @@ def fetch_ctgov_studies(sponsor_query: str) -> List[Dict[str, Any]]:
         batch = data.get("studies", [])
         studies.extend(batch)
         pages += 1
-
         page_token = data.get("nextPageToken")
         if not page_token or not batch:
             break
@@ -352,7 +356,6 @@ def fetch_ctgov_studies(sponsor_query: str) -> List[Dict[str, Any]]:
 
 
 def assign_phase(phases: Optional[List[str]]) -> str:
-    """Highest phase in the array wins. Empty/NA -> 'NA'."""
     if not phases:
         return "NA"
     ranked = [p for p in phases if p in PHASE_RANK]
@@ -361,9 +364,8 @@ def assign_phase(phases: Optional[List[str]]) -> str:
     return max(ranked, key=lambda p: PHASE_RANK.index(p))
 
 
-def parse_start_year(study_protocol: Dict[str, Any]) -> Tuple[Optional[int], bool]:
-    """Returns (year, was_inferred)."""
-    status = study_protocol.get("statusModule", {})
+def parse_start_year(proto: Dict[str, Any]) -> Tuple[Optional[int], bool]:
+    status = proto.get("statusModule", {})
     raw = status.get("startDateStruct", {}).get("date")
     inferred = False
     if not raw:
@@ -377,18 +379,24 @@ def parse_start_year(study_protocol: Dict[str, Any]) -> Tuple[Optional[int], boo
         return None, True
 
 
-def summarise_studies(studies: List[Dict[str, Any]]) -> Dict[str, Any]:
+def summarise_studies(
+    studies: List[Dict[str, Any]], alias_keywords: List[str]
+) -> Dict[str, Any]:
+    """Only counts trials whose LEAD sponsor string belongs to this company."""
     sponsor_counter: Counter = Counter()
     sponsor_class: Dict[str, str] = {}
     by_year_phase: Dict[int, Counter] = defaultdict(Counter)
-    inferred_dates = 0
-    industry_interventional = 0
-    total_seen = 0
+    inferred = 0
+    matched = 0
+
+    keywords = [k.lower() for k in alias_keywords]
+
+    def is_ours(name: str) -> bool:
+        low = name.lower()
+        return any(k in low for k in keywords)
 
     for study in studies:
         proto = study.get("protocolSection", {})
-        total_seen += 1
-
         design = proto.get("designModule", {})
         if design.get("studyType") != "INTERVENTIONAL":
             continue
@@ -402,30 +410,33 @@ def summarise_studies(studies: List[Dict[str, Any]]) -> Dict[str, Any]:
         sponsor_counter[name] += 1
         sponsor_class[name] = klass
 
-        if klass != "INDUSTRY":
+        if klass != "INDUSTRY" or not is_ours(name):
             continue
 
-        industry_interventional += 1
+        matched += 1
         year, was_inferred = parse_start_year(proto)
         if was_inferred:
-            inferred_dates += 1
+            inferred += 1
         if year is None:
             continue
-
         by_year_phase[year][assign_phase(design.get("phases"))] += 1
 
+    alias_candidates = [
+        (n, c) for n, c in sponsor_counter.most_common()
+        if sponsor_class.get(n) == "INDUSTRY" and is_ours(n)
+    ]
+
     return {
-        "total_returned": total_seen,
-        "industry_interventional": industry_interventional,
-        "sponsor_counter": sponsor_counter,
-        "sponsor_class": sponsor_class,
+        "total_returned": len(studies),
+        "matched_trials": matched,
         "by_year_phase": by_year_phase,
-        "inferred_dates": inferred_dates,
+        "inferred_dates": inferred,
+        "alias_candidates": alias_candidates,
     }
 
 
-def weighted_output(phase_counts: Counter) -> float:
-    return sum(PHASE_WEIGHTS.get(p, 0.0) * n for p, n in phase_counts.items())
+def weighted_output(counts: Counter) -> float:
+    return sum(PHASE_WEIGHTS.get(p, 0.0) * n for p, n in counts.items())
 
 
 # --------------------------------------------------------------------------
@@ -434,10 +445,10 @@ def weighted_output(phase_counts: Counter) -> float:
 
 def fmt_usd(v: Optional[float]) -> str:
     if v is None:
-        return "not reported"
+        return "-"
     if abs(v) >= 1e9:
         return f"${v / 1e9:,.2f}B"
-    return f"${v / 1e6:,.1f}M"
+    return f"${v / 1e6:,.0f}M"
 
 
 def main() -> int:
@@ -455,14 +466,17 @@ def main() -> int:
 
     sec_headers = {"User-Agent": ua, "Accept-Encoding": "gzip, deflate"}
 
-    w("# PharmaPulse - Phase 0 Feasibility Report")
+    w("# PharmaPulse - Phase 0 Feasibility Report (v2, corrected)")
     w()
     w(f"Generated: {datetime.utcnow().isoformat(timespec='seconds')}Z")
-    w(f"Lag used for efficiency metric: {DEFAULT_LAG_YEARS} years")
+    w()
+    w("> v1 derived fiscal years from XBRL's `fy` field, which is the FILING's")
+    w("> fiscal year, not the data point's. That collapsed several years into")
+    w("> one slot. v2 derives the year from each fact's period END date.")
     w()
 
     # ---- Q1 --------------------------------------------------------------
-    w("## Q1. SEC EDGAR - R&D tag coverage")
+    w("## Q1. SEC EDGAR - R&D tag coverage and values")
     w()
 
     try:
@@ -474,88 +488,104 @@ def main() -> int:
     w()
 
     financials: Dict[str, Dict[int, Dict[str, Any]]] = {}
-    tags_used: Dict[str, Optional[str]] = {}
-
-    w("| Company | Ticker | CIK | Tag used | Years found | Range | Latest R&D |")
-    w("|---|---|---|---|---|---|---|")
-
-    q1_notes: List[str] = []
+    chosen_tags: Dict[str, str] = {}
 
     for company in TEST_COMPANIES:
-        ticker = company["ticker"]
+        ticker, cname = company["ticker"], company["name"]
         cik = ticker_map.get(ticker)
+        w(f"### {cname} ({ticker})")
+        w()
+
         if not cik:
-            w(f"| {company['name']} | {ticker} | NOT FOUND | - | 0 | - | - |")
-            q1_notes.append(f"{ticker}: ticker not present in the SEC ticker map.")
+            w("Ticker not found in the SEC ticker map.")
+            w()
             continue
 
         try:
-            facts = fetch_company_facts(cik, sec_headers)
+            facts = http_get_json(
+                f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+                headers=sec_headers, throttle=SEC_THROTTLE_SECONDS,
+                label=f"companyfacts {cik}",
+            )
         except SpikeError as exc:
-            w(f"| {company['name']} | {ticker} | {cik} | ERROR | 0 | - | - |")
-            q1_notes.append(f"{ticker}: {exc}")
+            w(f"ERROR: {exc}")
+            w()
             continue
 
         if not facts:
-            w(f"| {company['name']} | {ticker} | {cik} | NO FACTS | 0 | - | - |")
+            w("No company facts returned.")
+            w()
             continue
 
-        by_year, tag, notes = extract_annual_rd(facts)
-        financials[ticker] = by_year
-        tags_used[ticker] = tag
-        for n in notes:
-            q1_notes.append(f"{ticker}: {n}")
+        audit = audit_all_tags(facts)
+        if not audit:
+            w("No usable R&D tags found.")
+            w()
+            continue
 
-        if by_year:
-            years = sorted(by_year)
-            latest = by_year[years[-1]]["value"]
-            w(
-                f"| {company['name']} | {ticker} | {cik} | "
-                f"{tag} | {len(years)} | {years[0]}-{years[-1]} | {fmt_usd(latest)} |"
-            )
-        else:
-            w(f"| {company['name']} | {ticker} | {cik} | NONE | 0 | - | - |")
-
-    w()
-    if q1_notes:
-        w("**Q1 notes:**")
+        w(f"CIK {cik}. Candidate R&D tags:")
         w()
-        for n in q1_notes:
-            w(f"- {n}")
+        w("| Tag | Years | In 2014-2024 | Range | Restatements |")
+        w("|---|---|---|---|---|")
+        for tag, info in sorted(audit.items(),
+                                key=lambda kv: kv[1]["years_in_window"], reverse=True):
+            w(f"| {tag} | {info['years_total']} | {info['years_in_window']} | "
+              f"{info['min_year']}-{info['max_year']} | {info['restatements']} |")
+        w()
+
+        tag = choose_tag(audit)
+        chosen_tags[ticker] = tag
+        financials[ticker] = audit[tag]["series"]
+
+        if tag != RD_TAG_PRIMARY:
+            w(f"**Selected `{tag}` rather than the primary tag.** Comparability "
+              "flag: values on different tags are not directly comparable "
+              "across companies.")
+            w()
+
+        w("Last 8 fiscal years (sanity-check against reality):")
+        w()
+        w("| Fiscal year | Period end | R&D expense | Restated |")
+        w("|---|---|---|---|")
+        for y in sorted(financials[ticker])[-8:]:
+            r = financials[ticker][y]
+            w(f"| {y} | {r['period_end']} | {fmt_usd(r['value'])} | "
+              f"{'yes' if r['restated'] else 'no'} |")
         w()
 
     covered = sum(
-        1 for t, y in financials.items()
-        if len([yr for yr in y if ANALYSIS_START_YEAR <= yr <= ANALYSIS_END_YEAR]) >= 8
+        1 for s in financials.values()
+        if len([y for y in s if ANALYSIS_START_YEAR <= y <= ANALYSIS_END_YEAR])
+        >= MIN_YEARS_REQUIRED
     )
-    w(
-        f"**Q1 VERDICT:** {covered} of {len(TEST_COMPANIES)} companies have 8+ years "
-        f"of annual R&D data in {ANALYSIS_START_YEAR}-{ANALYSIS_END_YEAR}."
-    )
-    w("Pass condition: 4 of 5. Below that, the company universe needs rethinking.")
+    w(f"**Q1 VERDICT:** {covered} of {len(TEST_COMPANIES)} companies have "
+      f"{MIN_YEARS_REQUIRED}+ years in {ANALYSIS_START_YEAR}-{ANALYSIS_END_YEAR}. "
+      "Pass condition: 4 of 5.")
     w()
+
+    mismatched = [t for t, tag in chosen_tags.items() if tag != RD_TAG_PRIMARY]
+    if mismatched:
+        w(f"**Tag comparability warning:** {', '.join(mismatched)} use a "
+          "non-primary tag. Cross-company ratios involving them need a UI caveat.")
+        w()
+
     w("---")
     w()
 
     # ---- Q2 --------------------------------------------------------------
-    w("## Q2. ClinicalTrials.gov - sponsor name variants")
+    w("## Q2. ClinicalTrials.gov - sponsor aliases")
     w()
-    w(
-        "This is the critical unknown. The table below is the seed data for the "
-        "`sponsor_aliases` table. Every row is a real sponsor string that must be "
-        "mapped by hand to a company."
-    )
+    w("Only lead sponsors matching this company's name patterns are counted. "
+      "These tables are the seed rows for `sponsor_aliases`.")
     w()
 
     trial_data: Dict[str, Dict[str, Any]] = {}
 
     for company in TEST_COMPANIES:
         ticker = company["ticker"]
-        query = company["ctgov_query"]
-        print(f"  fetching trials for {company['name']} (query: {query})...", flush=True)
-
+        print(f"  fetching trials for {company['name']}...", flush=True)
         try:
-            studies = fetch_ctgov_studies(query)
+            studies = fetch_ctgov_studies(company["ctgov_query"])
         except SpikeError as exc:
             w(f"### {company['name']} ({ticker})")
             w()
@@ -563,120 +593,86 @@ def main() -> int:
             w()
             continue
 
-        summary = summarise_studies(studies)
+        summary = summarise_studies(studies, company["alias_keywords"])
         trial_data[ticker] = summary
 
-        counter: Counter = summary["sponsor_counter"]
-        klass = summary["sponsor_class"]
-        industry_total = sum(
-            n for name, n in counter.items() if klass.get(name) == "INDUSTRY"
-        )
-        top = counter.most_common(1)
-        top_share = (top[0][1] / industry_total * 100) if top and industry_total else 0.0
+        aliases = summary["alias_candidates"]
+        total = sum(c for _, c in aliases)
+        top_share = (aliases[0][1] / total * 100) if aliases and total else 0.0
 
         w(f"### {company['name']} ({ticker})")
         w()
-        w(f"- Studies returned by query: **{summary['total_returned']:,}**")
-        w(f"- Interventional + industry-sponsored: **{summary['industry_interventional']:,}**")
-        w(f"- Distinct lead-sponsor strings: **{len(counter):,}**")
-        w(f"- Share captured by the single most common string: **{top_share:.1f}%**")
+        w(f"- Trials attributed to this company: **{summary['matched_trials']:,}**")
+        w(f"- Distinct sponsor strings: **{len(aliases)}**")
+        w(f"- Share captured by the exact-name string: **{top_share:.1f}%**")
         w(f"- Trials needing an inferred start date: **{summary['inferred_dates']:,}**")
         w()
-        w("| Lead sponsor string (verbatim) | Class | Trials |")
-        w("|---|---|---|")
-        for name, count in counter.most_common(25):
-            safe = name.replace("|", "\\|")
-            w(f"| {safe} | {klass.get(name, '?')} | {count} |")
-        if len(counter) > 25:
-            w(f"| _...and {len(counter) - 25} more distinct strings_ | | |")
+        w("| Sponsor string (verbatim) | Trials |")
+        w("|---|---|")
+        for name, count in aliases[:15]:
+            w(f"| {name.replace('|', chr(92) + '|')} | {count} |")
+        if len(aliases) > 15:
+            w(f"| _...and {len(aliases) - 15} more_ | |")
         w()
 
-    w("**Q2 VERDICT:** read the 'share captured by the single most common string' "
-      "figure for each company.")
-    w()
-    w("- **70%+** - exact matching plus a handful of curated aliases is enough. Proceed as specified.")
-    w("- **40-70%** - subsidiary mapping is doing real work. Proceed, but budget a full session on the alias table and cut the universe to ~15 companies.")
-    w("- **Under 40%** - the join is fragile. Shrink to 8-10 companies and treat the alias table as the main deliverable.")
-    w()
     w("---")
     w()
 
     # ---- Q3 --------------------------------------------------------------
-    w("## Q3. Does the efficiency metric produce a useful spread?")
+    w("## Q3. Efficiency metric spread (recomputed on corrected financials)")
     w()
-    w(
-        f"Metric: phase-weighted trial starts in year Y divided by R&D expense in "
-        f"year Y-{DEFAULT_LAG_YEARS}, per $1M. Phase weights: "
-        + ", ".join(f"{k}={v}" for k, v in PHASE_WEIGHTS.items())
-    )
-    w()
-    w("**These weights are assumptions, not measured values.**")
+    w(f"Phase-weighted trial starts in year Y / R&D in year Y-{DEFAULT_LAG_YEARS}, per $1M.")
+    w(f"Weights: {', '.join(f'{k}={v}' for k, v in PHASE_WEIGHTS.items())} "
+      "(assumptions, not measured values).")
     w()
 
-    years_to_show = list(range(ANALYSIS_END_YEAR - 5, ANALYSIS_END_YEAR + 1))
-    header = "| Company | " + " | ".join(str(y) for y in years_to_show) + " |"
-    w(header)
-    w("|---" * (len(years_to_show) + 1) + "|")
+    years = list(range(2018, 2025))
+    w("| Company | " + " | ".join(str(y) for y in years) + " |")
+    w("|---" * (len(years) + 1) + "|")
 
     all_ratios: List[float] = []
-
     for company in TEST_COMPANIES:
         ticker = company["ticker"]
-        by_year_phase = trial_data.get(ticker, {}).get("by_year_phase", {})
+        byp = trial_data.get(ticker, {}).get("by_year_phase", {})
         fin = financials.get(ticker, {})
-
         cells: List[str] = []
-        for year in years_to_show:
-            phase_counts = by_year_phase.get(year)
-            rd_rec = fin.get(year - DEFAULT_LAG_YEARS)
-            if not phase_counts or not rd_rec or not rd_rec.get("value"):
+        for y in years:
+            counts = byp.get(y)
+            rd = fin.get(y - DEFAULT_LAG_YEARS)
+            if not counts or not rd or not rd.get("value") or rd["value"] <= 0:
                 cells.append("-")
                 continue
-            rd_musd = rd_rec["value"] / 1e6
-            if rd_musd <= 0:
-                cells.append("-")
-                continue
-            ratio = weighted_output(phase_counts) / rd_musd
+            ratio = weighted_output(counts) / (rd["value"] / 1e6)
             all_ratios.append(ratio)
             cells.append(f"{ratio:.4f}")
-
         w(f"| {company['name']} | " + " | ".join(cells) + " |")
 
     w()
-
     if len(all_ratios) >= 5:
         lo, hi = min(all_ratios), max(all_ratios)
         srt = sorted(all_ratios)
-        median = srt[len(srt) // 2]
-        spread = (hi / lo) if lo > 0 else float("inf")
-        w(f"- Observations: **{len(all_ratios)}**")
-        w(f"- Min / median / max: **{lo:.4f} / {median:.4f} / {hi:.4f}**")
-        w(f"- Max-to-min ratio: **{spread:.1f}x**")
+        med = srt[len(srt) // 2]
+        spread = hi / lo if lo > 0 else float("inf")
+        w(f"- Observations: **{len(all_ratios)}**  |  Min / median / max: "
+          f"**{lo:.4f} / {med:.4f} / {hi:.4f}**  |  Max-to-min: **{spread:.1f}x**")
         w()
         if spread >= 3:
-            w("**Q3 VERDICT: PASS.** There is real variation between companies. "
-              "The metric distinguishes them, so the product has something to show.")
+            w("**Q3 VERDICT: PASS.** Real variation between companies.")
         elif spread >= 1.8:
-            w("**Q3 VERDICT: MARGINAL.** Some spread, but weak. Consider reframing the "
-              "headline around pipeline mix over time rather than cross-company ranking.")
+            w("**Q3 VERDICT: MARGINAL.** Weak spread. Consider reframing around "
+              "pipeline mix over time rather than cross-company ranking.")
         else:
-            w("**Q3 VERDICT: FAIL.** Every company lands in the same band. The "
-              "cross-company comparison has no story. Reframe before building UI.")
+            w("**Q3 VERDICT: FAIL.** No cross-company story. Reframe before UI.")
     else:
-        w("**Q3 VERDICT: INCONCLUSIVE.** Too few computable company-years. "
-          "Check the Q1 and Q2 sections above for the cause.")
+        w("**Q3 VERDICT: INCONCLUSIVE.** Too few computable company-years.")
 
     w()
     w("---")
     w()
-    w("## What to do next")
-    w()
-    w("Paste this entire report back into the chat. Do not start building the "
-      "database until the three verdicts above have been reviewed.")
+    w("Paste this entire report back into the chat.")
 
     with open("phase0_report.md", "w", encoding="utf-8") as fh:
         fh.write("\n".join(out))
-
     return 0
 
 
